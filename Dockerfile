@@ -1,11 +1,11 @@
 # MyFitnessPal MCP Server
 # 
-# NOTE: This MCP uses browser cookie authentication by default.
-# For Docker deployment, you'll need to mount your browser's cookie database
-# or use an alternative authentication method.
+# Legacy image definition, unsupported by the restricted macOS edition.
+# Authentication requires the native macOS Keychain; Linux containers cannot
+# run this edition. Do not mount browser profiles into this container.
 #
 # Build: docker build -t mfp-mcp .
-# Run: docker run -it --rm -v ~/.config/google-chrome:/root/.config/google-chrome:ro mfp-mcp
+# For supported deployment, follow the native macOS instructions in README.md.
 
 FROM python:3.12-slim
 

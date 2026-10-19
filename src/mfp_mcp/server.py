@@ -5,36 +5,21 @@ A Model Context Protocol (MCP) server that provides tools for interacting
 with MyFitnessPal data including food diary, exercises, measurements, goals,
 water intake, and food search.
 
-Authentication Methods (in order of priority):
-1. Environment variables: MFP_USERNAME and MFP_PASSWORD
-2. Stored session cookies: ~/.mfp_mcp/cookies.json
-3. Chromium-based browser cookies (macOS): Arc, Chrome, Edge, Brave, Vivaldi,
-   Opera, and any other installed Chromium browser detected via the keychain
-   "Safe Storage" entry.
-4. browser_cookie3 fallback (legacy Chrome/Firefox paths on any OS)
+Authentication: manually imported MyFitnessPal session in macOS Keychain.
+No browser discovery, credential login, or plaintext cookie-file fallback.
 """
 
-import hashlib
 import json
 import logging
-import os
-import sqlite3
-import subprocess
 import sys
-import tempfile
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from http.cookiejar import CookieJar, Cookie
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from enum import Enum
 from collections import OrderedDict
-import time
-from cryptography.fernet import Fernet
-import keyring
 
-import httpx
 from mcp.server.fastmcp import FastMCP
+from .security import load_cookies, dict_to_cookiejar, RestrictedSession, SecurityError
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Configure logging to stderr (required for stdio transport)
@@ -48,10 +33,6 @@ logger = logging.getLogger("mfp_mcp")
 # Initialize MCP server
 mcp = FastMCP("myfitnesspal_mcp")
 
-# Configuration paths
-CONFIG_DIR = Path.home() / ".mfp_mcp"
-COOKIES_FILE = CONFIG_DIR / "cookies.json"
-
 # MyFitnessPal's v2 JSON API, used for diary writes. The legacy HTML form
 # endpoint (/food/diary/{user}/add) was removed by MFP and now returns 404.
 MFP_API_BASE = "https://api.myfitnesspal.com"
@@ -64,694 +45,32 @@ VALID_MEALS = ("Breakfast", "Lunch", "Dinner", "Snacks")
 # ============================================================================
 
 
-def ensure_config_dir():
-    """Ensure the config directory exists."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_DIR.chmod(0o700)
-
-
-def save_cookies(cookies: Dict[str, str]):
-    """
-    Save session cookies to file for persistence.
-    
-    Args:
-        cookies: Dictionary of cookie name -> value
-    """
-    ensure_config_dir()
-    cookie_data = {
-        "cookies": cookies,
-        "saved_at": datetime.now().isoformat(),
-    }
-    with open(COOKIES_FILE, "w") as f:
-        json.dump(cookie_data, f, indent=2)
-    # Session cookies grant full account access - restrict to owner only
-    COOKIES_FILE.chmod(0o600)
-    logger.info(f"Saved session cookies to {COOKIES_FILE}")
-
-
-def load_cookies() -> Optional[Dict[str, str]]:
-    """
-    Load session cookies from file.
-    
-    Returns:
-        Dictionary of cookies if file exists and is valid, None otherwise
-    """
-    if not COOKIES_FILE.exists():
-        return None
-    
-    try:
-        with open(COOKIES_FILE, "r") as f:
-            cookie_data = json.load(f)
-        
-        # Check if cookies are less than 30 days old
-        saved_at = datetime.fromisoformat(cookie_data.get("saved_at", "2000-01-01"))
-        if datetime.now() - saved_at > timedelta(days=30):
-            logger.info("Stored cookies are expired (>30 days old)")
-            return None
-        
-        return cookie_data.get("cookies")
-    except Exception as e:
-        logger.warning(f"Failed to load cookies: {e}")
-        return None
-
-
-def dict_to_cookiejar(cookies_dict: Dict[str, str], domain: str = ".myfitnesspal.com") -> CookieJar:
-    """
-    Convert a dictionary of cookies to a CookieJar that can be used by myfitnesspal.Client.
-    
-    Args:
-        cookies_dict: Dictionary of cookie name -> value
-        domain: Domain for the cookies (default: .myfitnesspal.com)
-    
-    Returns:
-        CookieJar: A CookieJar object populated with the cookies
-    """
-    jar = CookieJar()
-    
-    for name, value in cookies_dict.items():
-        cookie = Cookie(
-            version=0,
-            name=name,
-            value=value,
-            port=None,
-            port_specified=False,
-            domain=domain,
-            domain_specified=True,
-            domain_initial_dot=domain.startswith('.'),
-            path="/",
-            path_specified=True,
-            secure=True,
-            expires=int(time.time()) + 86400 * 30,  # 30 days from now
-            discard=False,
-            comment=None,
-            comment_url=None,
-            rest={"HttpOnly": None},
-            rfc2109=False,
-        )
-        jar.set_cookie(cookie)
-    
-    return jar
-
-# ============================================================================
-# Chromium Browser Cookie Extraction (macOS)
-# ============================================================================
-#
-# Chromium-based browsers (Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...)
-# store cookies in a SQLite database with each value encrypted using
-# AES-128-CBC. The encryption key is derived from a per-browser password
-# stored in the macOS Keychain under a service name like
-# "<Browser> Safe Storage".
-#
-# We discover installed Chromium browsers by listing keychain "Safe Storage"
-# entries and try each one until we find a valid MyFitnessPal session token.
-# This is what lets the MCP "just work" when the user logs in via any modern
-# browser — including Arc, which `browser_cookie3` does not support.
-
-# Cookies DB locations relative to ~/Library/Application Support/.
-# Newer Chromium versions moved the cookies DB into a "Network/" subdir;
-# we try the new path first, falling back to the legacy location.
-_CHROMIUM_COOKIES_PATHS_MACOS: Dict[str, List[str]] = {
-    "Arc":            ["Arc/User Data/Default/Network/Cookies",
-                       "Arc/User Data/Default/Cookies"],
-    "Chrome":         ["Google/Chrome/Default/Network/Cookies",
-                       "Google/Chrome/Default/Cookies"],
-    "Chromium":       ["Chromium/Default/Network/Cookies",
-                       "Chromium/Default/Cookies"],
-    "Microsoft Edge": ["Microsoft Edge/Default/Network/Cookies",
-                       "Microsoft Edge/Default/Cookies"],
-    "Brave":          ["BraveSoftware/Brave-Browser/Default/Network/Cookies",
-                       "BraveSoftware/Brave-Browser/Default/Cookies"],
-    "Vivaldi":        ["Vivaldi/Default/Network/Cookies",
-                       "Vivaldi/Default/Cookies"],
-    "Opera":          ["com.operasoftware.Opera/Network/Cookies",
-                       "com.operasoftware.Opera/Cookies"],
-}
-
-# Friendly browser names accepted by `refresh_browser_cookies("<name>")`
-# mapped to the canonical "Safe Storage" service prefix.
-_CHROMIUM_BROWSER_ALIASES: Dict[str, str] = {
-    "arc": "Arc",
-    "chrome": "Chrome",
-    "chromium": "Chromium",
-    "edge": "Microsoft Edge",
-    "brave": "Brave",
-    "vivaldi": "Vivaldi",
-    "opera": "Opera",
-}
-
-
-def _safe_storage_keychain_password(service_name: str) -> Optional[bytes]:
-    """Look up `service_name` in the macOS Keychain and return the raw bytes.
-
-    Returns None if the entry doesn't exist or access is denied.
-
-    NOTE: on a fresh install the first read of another app's Safe Storage
-    entry triggers a macOS keychain authorization dialog ("<app> wants to
-    use information stored in your keychain"). If this MCP is running
-    headless (e.g. spawned by Claude Desktop with no UI focus), the prompt
-    is silently denied and this call returns None after the 5s timeout.
-    The user only needs to click "Always Allow" once, but they need to
-    know to look for the prompt — the README troubleshooting section
-    documents this.
-    """
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", service_name, "-w"],
-            capture_output=True, check=True, timeout=5,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-            FileNotFoundError):
-        return None
-
-
-def _list_chromium_safe_storage_services_macos() -> List[str]:
-    """Return all keychain service names ending in 'Safe Storage'.
-
-    These identify installed Chromium-based browsers. We don't hard-code
-    the list — anything matching the pattern is fair game.
-    """
-    keychain_path = os.path.expanduser("~/Library/Keychains/login.keychain-db")
-    try:
-        result = subprocess.run(
-            ["security", "dump-keychain", keychain_path],
-            capture_output=True, check=True, timeout=10,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-            FileNotFoundError):
-        return []
-    services = set()
-    text = result.stdout.decode("utf-8", errors="replace")
-    for line in text.splitlines():
-        # The `svce` attribute appears as: "svce"<blob>="Arc Safe Storage"
-        if '"svce"<blob>=' not in line or "Safe Storage" not in line:
-            continue
-        try:
-            value = line.split('"svce"<blob>=', 1)[1].strip()
-            value = value.strip('"')
-            if value.endswith("Safe Storage"):
-                services.add(value)
-        except IndexError:
-            continue
-    return sorted(services)
-
-
-def _derive_chromium_aes_key_macos(safe_storage_password: bytes) -> bytes:
-    """Derive the AES-128 cookie key Chromium uses on macOS.
-
-    Per Chromium's `os_crypt_mac.mm`: PBKDF2-HMAC-SHA1 with salt='saltysalt',
-    1003 iterations, 16-byte key.
-    """
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.backends import default_backend
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA1(),
-        length=16,
-        salt=b"saltysalt",
-        iterations=1003,
-        backend=default_backend(),
-    )
-    return kdf.derive(safe_storage_password)
-
-
-def _decrypt_chromium_value_macos(encrypted_value: bytes,
-                                   aes_key: bytes,
-                                   host_key: str = "") -> Optional[str]:
-    """Decrypt a single Chromium cookie `encrypted_value`. Returns None on
-    failure or for unsupported schemes (e.g. v20 app-bound encryption).
-
-    `host_key` is the cookie's host column from SQLite; modern Chromium
-    prepends `SHA-256(host_key)` to the plaintext as an integrity tag, so
-    we strip exactly that 32-byte prefix when it's present. Without this
-    check, long ASCII cookie values from legacy rows would be silently
-    truncated by 32 bytes (the shortened plaintext still decodes as UTF-8).
-    """
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    if not encrypted_value or len(encrypted_value) < 3:
-        return None
-    prefix = encrypted_value[:3]
-    if prefix not in (b"v10", b"v11"):
-        # v20 needs app-bound decryption via the browser process and is not
-        # supported here. Caller should fall back to a different source.
-        return None
-    try:
-        cipher = Cipher(
-            algorithms.AES(aes_key),
-            modes.CBC(b" " * 16),
-            backend=default_backend(),
-        )
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(encrypted_value[3:]) + decryptor.finalize()
-    except Exception:
-        return None
-    # Strip PKCS#7 padding.
-    if not plaintext:
-        return None
-    pad_len = plaintext[-1]
-    if pad_len < 1 or pad_len > 16:
-        return None
-    plaintext = plaintext[:-pad_len]
-    # Strip the SHA-256(host_key) integrity prefix only when it actually
-    # matches — never blindly. Legacy rows without the prefix have shorter
-    # but otherwise normal plaintexts.
-    if host_key and len(plaintext) >= 32:
-        expected_prefix = hashlib.sha256(host_key.encode("utf-8")).digest()
-        if plaintext[:32] == expected_prefix:
-            plaintext = plaintext[32:]
-    try:
-        return plaintext.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None
-
-
-def _snapshot_sqlite_db(src: Path, dst: str) -> None:
-    """Copy a live SQLite DB into `dst` using the backup API.
-
-    The browser's cookies DB may be open in WAL mode with active writers;
-    a plain `shutil.copy` misses committed rows that still live in the
-    `-wal` sidecar. The backup API handles WAL/SHM correctly, takes a
-    consistent snapshot, and doesn't require taking a write lock — opening
-    the source read-only is enough.
-    """
-    src_con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-    try:
-        dst_con = sqlite3.connect(dst)
-        try:
-            src_con.backup(dst_con)
-        finally:
-            dst_con.close()
-    finally:
-        src_con.close()
-
-
-def _extract_chromium_cookies_macos(
-    cookies_db_path: Path,
-    aes_key: bytes,
-    domain: str = "myfitnesspal.com",
-) -> Dict[str, str]:
-    """Read cookies for `domain` (and its subdomains) from a Chromium DB.
-
-    The DB is snapshotted via the SQLite backup API so rows pending in the
-    `-wal` file are included. Cookies whose decrypted value isn't clean
-    UTF-8 are skipped — those can't go into HTTP headers anyway.
-    """
-    # `mkstemp` gives us a uniquely-named file we own, immune to the
-    # time-of-check/time-of-use race that `mktemp` would create.
-    fd, tmp_path = tempfile.mkstemp(suffix=".cookies.db")
-    os.close(fd)
-    try:
-        _snapshot_sqlite_db(cookies_db_path, tmp_path)
-        con = sqlite3.connect(tmp_path)
-        try:
-            # `host_key = 'myfitnesspal.com' OR host_key LIKE '%.myfitnesspal.com'`
-            # — exact match + any subdomain. Avoids matching unrelated hosts
-            # like `notmyfitnesspal.com` that the loose LIKE pattern would.
-            rows = con.execute(
-                "SELECT name, value, encrypted_value, host_key FROM cookies "
-                "WHERE host_key = ? OR host_key LIKE ?",
-                (domain, f"%.{domain}"),
-            ).fetchall()
-        finally:
-            con.close()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-    cookies: Dict[str, str] = {}
-    for name, plain, enc, host_key in rows:
-        value = (
-            plain if plain
-            else _decrypt_chromium_value_macos(enc, aes_key, host_key)
-        )
-        if value is None or "�" in value:
-            continue
-        cookies[name] = value
-    return cookies
-
-
-def _has_real_mfp_session(cookies: Dict[str, str]) -> bool:
-    """True if the cookie set looks like an authenticated MFP session.
-
-    A pre-auth response can include cookies with 'auth' in the name
-    (e.g. `__Host-next-auth.csrf-token`), so we look for the specific
-    session-token markers MFP actually uses.
-    """
-    return any(
-        "session-token" in name or name == "_mfp_session"
-        for name in cookies
-    )
-
-
-def _try_extract_from_chromium_browser(
-    service: str,
-) -> Optional[Dict[str, str]]:
-    """Extract cookies from one specific Chromium browser by Safe Storage
-    service name (e.g. 'Arc Safe Storage'). Returns None on any failure."""
-    browser_name = service.replace(" Safe Storage", "").strip()
-    relative_paths = _CHROMIUM_COOKIES_PATHS_MACOS.get(browser_name)
-    if not relative_paths:
-        logger.debug(f"No cookies DB path mapping for '{browser_name}'")
-        return None
-    appsup = Path.home() / "Library" / "Application Support"
-    db_path = next(
-        (appsup / p for p in relative_paths if (appsup / p).exists()),
-        None,
-    )
-    if not db_path:
-        logger.debug(f"No cookies DB found for '{browser_name}'")
-        return None
-    password = _safe_storage_keychain_password(service)
-    if not password:
-        logger.debug(f"Keychain lookup failed for '{service}'")
-        return None
-    try:
-        aes_key = _derive_chromium_aes_key_macos(password)
-        return _extract_chromium_cookies_macos(db_path, aes_key)
-    except Exception as e:
-        logger.debug(f"Cookie extraction failed for '{browser_name}': {e}")
-        return None
-
-
-def try_chromium_browsers_for_session_cookies(
-) -> Optional[Tuple[str, Dict[str, str]]]:
-    """Discover installed Chromium browsers (macOS only) and return the first
-    one that has a valid MyFitnessPal session token.
-
-    Returns a (browser_name, cookies) tuple, or None if no browser yielded
-    a usable session.
-    """
-    if sys.platform != "darwin":
-        return None
-    services = _list_chromium_safe_storage_services_macos()
-    if not services:
-        logger.debug("No Chromium Safe Storage entries found in keychain")
-        return None
-    for service in services:
-        cookies = _try_extract_from_chromium_browser(service)
-        if not cookies:
-            continue
-        browser_name = service.replace(" Safe Storage", "").strip()
-        if _has_real_mfp_session(cookies):
-            logger.info(
-                f"Found valid MyFitnessPal session in {browser_name} "
-                f"({len(cookies)} cookies)"
-            )
-            return browser_name, cookies
-        logger.debug(
-            f"{browser_name} had {len(cookies)} cookies but no session token"
-        )
-    return None
-
-
-def looks_like_fernet_token(value: str) -> bool:
-    """Return True if the value appears to be a Fernet token."""
-    if not value:
-        return False
-    # Fernet tokens are URL-safe base64-encoded and typically begin with "gAAAAA".
-    # Use a lightweight prefix check so plaintext credentials continue to work
-    # even when MFP_SECRET_KEY is configured.
-    #
-    # Edge case: a genuine plaintext password that starts with "gAAAAA" is
-    # misclassified as a ciphertext, fails Fernet decryption, and
-    # `get_decrypted_credential` returns None — credential auth is silently
-    # skipped and the caller falls through to cookie-based auth. Extremely
-    # unlikely for a real password, and the fallback is graceful, so we
-    # accept this heuristic rather than adding a length/base64 check.
-    return value.startswith("gAAAAA")
-
-
-KEYRING_SERVICE = "mfp-mcp"
-KEYRING_SECRET_KEY_ACCOUNT = "MFP_SECRET_KEY"
-
-
-def get_secret_key() -> Optional[str]:
-    """Resolves MFP_SECRET_KEY from, in order:
-    1. The MFP_SECRET_KEY environment variable.
-    2. The OS keychain (service: 'mfp-mcp', account: 'MFP_SECRET_KEY').
-
-    Returns the key string, or None if not found in either location.
-    """
-    key = os.environ.get("MFP_SECRET_KEY")
-    if key:
-        logger.info("MFP_SECRET_KEY loaded from environment variable.")
-        return key
-
-    try:
-        key = keyring.get_password(KEYRING_SERVICE, KEYRING_SECRET_KEY_ACCOUNT)
-        if key:
-            logger.info("MFP_SECRET_KEY loaded from OS keychain.")
-            return key
-    except Exception as e:
-        logger.warning(f"Keychain lookup failed: {e}")
-
-    return None
-
-
-def get_decrypted_credential(env_var_name: str) -> Optional[str]:
-    """Retrieves credentials from environment variables, decrypting Fernet tokens when needed.
-
-    The decryption key (MFP_SECRET_KEY) is resolved from the environment variable first,
-    then from the OS keychain as a fallback.
-
-    Returns the decrypted string on success, the raw value when no decryption is needed,
-    or None if the env var is missing, decryption fails, or the value looks encrypted but
-    no key is available (to avoid passing ciphertext to the auth flow).
-    """
-    encrypted_value = os.environ.get(env_var_name)
-
-    if not encrypted_value:
-        logger.warning(f"Missing {env_var_name}.")
-        return None
-
-    if not looks_like_fernet_token(encrypted_value):
-        # Plain-text credential — no key lookup needed.
-        return encrypted_value
-
-    # Value looks like a Fernet token; resolve the secret key only now.
-    secret_key = get_secret_key()
-
-    if not secret_key:
-        logger.warning(
-            f"{env_var_name} appears to be encrypted but MFP_SECRET_KEY is not set. "
-            "Credential auth will be skipped to avoid passing ciphertext to the auth flow."
-        )
-        return None
-
-    try:
-        f = Fernet(secret_key.encode())
-        return f.decrypt(encrypted_value.encode()).decode()
-    except Exception as e:
-        logger.error(f"Decryption failed for {env_var_name}: {e}")
-        return None
-
-def authenticate_with_credentials(username: str, password: str) -> Dict[str, str]:
-    """
-    Authenticate with MyFitnessPal using username/password.
-    
-    Args:
-        username: MyFitnessPal username or email
-        password: MyFitnessPal password
-    
-    Returns:
-        Dictionary of session cookies
-        
-    Raises:
-        RuntimeError: If authentication fails
-    """
-    # Log authentication attempt without exposing the username
-    logger.info("Authenticating with credentials")
-    
-    # MyFitnessPal login URL and endpoints
-    LOGIN_URL = "https://www.myfitnesspal.com/account/login"
-    
-    try:
-        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
-            # First, get the login page to obtain CSRF token
-            response = client.get(LOGIN_URL)
-            response.raise_for_status()
-            
-            # Extract CSRF token from cookies or page
-            cookies = dict(response.cookies)
-            
-            # Attempt login
-            login_data = {
-                "username": username,
-                "password": password,
-            }
-            
-            # Try the standard form login
-            login_response = client.post(
-                LOGIN_URL,
-                data=login_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Referer": LOGIN_URL,
-                },
-            )
-            
-            # MyFitnessPal moved to a NextAuth backend, so the legacy form
-            # POST flow this function uses no longer actually logs the user
-            # in — the endpoint just returns HTTP 200 with a fresh CSRF
-            # cookie. The old success check matched any cookie containing
-            # 'auth' (which `__Host-next-auth.csrf-token` does), reporting
-            # success and overwriting cookies.json with useless pre-auth
-            # cookies. Require a real session token before claiming success.
-            all_cookies = dict(client.cookies)
-            if _has_real_mfp_session(all_cookies):
-                logger.info("Successfully authenticated with credentials")
-                return all_cookies
-            raise RuntimeError(
-                "Login appeared to fail — response contained no session token. "
-                "MyFitnessPal's form login flow does not work against the "
-                "current NextAuth backend. Log into myfitnesspal.com in any "
-                "Chromium-based browser (Arc, Chrome, Edge, Brave, ...) and "
-                "the MCP will pick up the session automatically."
-            )
-                
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"HTTP error during authentication: {e}")
-    except Exception as e:
-        raise RuntimeError(f"Authentication failed: {e}")
-
-
 def get_mfp_client():
-    """
-    Get an authenticated MyFitnessPal client.
-
-    Authentication is attempted in this order:
-    1. Environment variables (MFP_USERNAME, MFP_PASSWORD)
-       a. First tries previously-cached cookies for this user.
-       b. Then falls back to form login (only useful on legacy accounts).
-    2. Stored session cookies (~/.mfp_mcp/cookies.json)
-    3. Chromium-based browser cookies (macOS): auto-discovers Arc, Chrome,
-       Edge, Brave, Vivaldi, Opera, or any other installed Chromium browser
-       via the keychain's "Safe Storage" entries.
-    4. `browser_cookie3` default fallback (legacy Chrome/Firefox paths).
-
-    Returns:
-        myfitnesspal.Client: Authenticated client instance
-
-    Raises:
-        RuntimeError: If all authentication methods fail
-    """
+    """Use only our Keychain session and restricted HTTPS transport; fail closed."""
+    cookies = load_cookies()
     import myfitnesspal
-    import requests as _requests
-    import cloudscraper as _cloudscraper
-    # cloudscraper alters TLS fingerprints in a way that triggers MFP's
-    # Cloudflare 403. Plain requests works fine with the browser session cookies.
-    _cloudscraper.create_scraper = lambda **kw: _requests.Session()
 
-    last_error = None
+    class RestrictedClient(myfitnesspal.Client):
+        # Explicit initialization for pinned myfitnesspal 2.1.2. Never invoke
+        # its constructor: it enables browser discovery and cloudscraper.
+        BASE_URL = "https://www.myfitnesspal.com/"
 
-    # Method 1: Try environment variable credentials
-    username = get_decrypted_credential("MFP_USERNAME")
-    password = get_decrypted_credential("MFP_PASSWORD")
+        def __init__(self, cookies):
+            self._client_instance_id = uuid.uuid4()
+            self._request_counter = 0
+            self._log_requests_to = None
+            self.unit_aware = False
+            self.session = RestrictedSession()
+            self.session.cookies.update(dict_to_cookiejar(cookies))
+            self._auth_data = self._get_auth_data()
+            self._user_metadata = self._get_user_metadata()
 
-    if username and password:
-        logger.info("Attempting authentication with environment credentials")
-
-        # First check if we have valid stored cookies from a previous credential auth
-        stored_cookies = load_cookies()
-        if stored_cookies:
-            logger.info("Found stored session cookies, testing validity...")
-            try:
-                cookiejar = dict_to_cookiejar(stored_cookies)
-                client = myfitnesspal.Client(cookiejar=cookiejar)
-                # Test the connection
-                _ = client.get_date(date.today())
-                logger.info("Stored cookies are valid")
-                return client
-            except Exception as e:
-                logger.info(f"Stored cookies invalid: {e}, re-authenticating...")
-
-        # Authenticate with credentials and save cookies
-        try:
-            cookies = authenticate_with_credentials(username, password)
-            save_cookies(cookies)
-
-            # Create client with the new cookies
-            cookiejar = dict_to_cookiejar(cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with credentials")
-            return client
-
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Credential authentication failed: {e}")
-            # Fall through to other methods
-
-    # Method 2: Try stored session cookies (without credential auth)
-    stored_cookies = load_cookies()
-    if stored_cookies:
-        logger.info("Attempting authentication with stored cookies")
-        try:
-            cookiejar = dict_to_cookiejar(stored_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            # Test the connection
-            _ = client.get_date(date.today())
-            logger.info("Successfully authenticated with stored cookies")
-            return client
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Stored cookie authentication failed: {e}")
-
-    # Method 3: Auto-discover Chromium-based browsers (macOS) and pull a live
-    # session from whichever one is logged into MFP. This works for Arc,
-    # Chrome, Edge, Brave, Vivaldi, Opera, etc. — anything that registers a
-    # "<Browser> Safe Storage" entry in the macOS keychain.
-    logger.info("Attempting authentication via Chromium browser auto-discovery")
     try:
-        result = try_chromium_browsers_for_session_cookies()
-        if result:
-            browser_name, chromium_cookies = result
-            cookiejar = dict_to_cookiejar(chromium_cookies)
-            client = myfitnesspal.Client(cookiejar=cookiejar)
-            _ = client.get_date(date.today())
-            # Only persist after we've verified it works, so a transient
-            # failure can't poison cookies.json.
-            save_cookies(chromium_cookies)
-            logger.info(
-                f"Successfully authenticated via Chromium auto-discovery "
-                f"({browser_name})"
-            )
-            return client
-        logger.info("No Chromium browser had a usable MFP session")
-    except Exception as e:
-        last_error = e
-        logger.warning(f"Chromium auto-discovery authentication failed: {e}")
-
-    # Method 4: Try browser cookies via browser_cookie3 (legacy fallback)
-    logger.info("Attempting authentication with browser_cookie3 fallback")
-    try:
-        client = myfitnesspal.Client()
-        # Test the connection
-        _ = client.get_date(date.today())
-        logger.info("Successfully authenticated with browser cookies")
-        return client
-    except Exception as e:
-        last_error = e
-        raise RuntimeError(
-            f"All authentication methods failed. Last error: {str(last_error)}\n\n"
-            "Please try one of these solutions:\n"
-            "1. Log into myfitnesspal.com in any Chromium-based browser "
-            "(Arc, Chrome, Edge, Brave, Vivaldi, Opera, ...) — the MCP will "
-            "auto-discover the session on macOS.\n"
-            "2. Set MFP_USERNAME and MFP_PASSWORD in Claude Desktop config "
-            "(legacy form-login flow; rarely works against the current "
-            "NextAuth backend).\n"
-            "3. Manually populate ~/.mfp_mcp/cookies.json with a valid "
-            "session token."
-        )
-
-
-# ============================================================================
-# Data Formatting Helper Functions
-# ============================================================================
+        return RestrictedClient(cookies)
+    except SecurityError:
+        raise
+    except Exception:
+        raise RuntimeError("MyFitnessPal authentication failed. Re-import your session in Terminal.") from None
 
 
 def parse_date(date_str: Optional[str] = None) -> date:
@@ -1388,10 +707,7 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
             # means a literal count of `unit`, not a count of packs.
             chosen = next((c for c in candidates if c.get("value") == 1.0), candidates[0])
         else:
-            logger.warning(
-                f"Unit {unit!r} not found for food {food.get('id')}; "
-                f"using default serving {chosen.get('unit')!r}"
-            )
+            logger.warning("Requested unit not found; using default serving")
 
     # The diary endpoint rejects any serving_size field beyond these three.
     return {
@@ -1460,23 +776,8 @@ def _web_headers(csrf: Optional[str] = None, json_body: bool = False) -> Dict[st
 
 
 def _api_error_detail(response) -> str:
-    """Pull MFP's structured error text out of a failed response.
-
-    Mirrors how add_food_to_diary surfaces v2 errors, so we report the API's own
-    message rather than echoing an arbitrary slice of the response body.
-    """
-    try:
-        body = response.json()
-    except Exception:
-        return ""
-    if not isinstance(body, dict):
-        return ""
-    return str(
-        body.get("error_description")
-        or body.get("error_details", {}).get("item_error")
-        or body.get("error")
-        or ""
-    )
+    """Do not forward remote error bodies, which may contain credentials."""
+    return "Remote error details withheld; check the request and your session."
 
 
 def _get_csrf_token(client) -> Optional[str]:
@@ -1488,7 +789,7 @@ def _get_csrf_token(client) -> Optional[str]:
         if r.status_code == 200:
             return r.json().get("csrfToken")
     except Exception as e:
-        logger.warning(f"Could not fetch CSRF token: {e}")
+        logger.warning("Could not fetch CSRF token")
     return None
 
 
@@ -1597,7 +898,7 @@ def create_custom_food(client, spec: Dict[str, Any]) -> Dict[str, Any]:
     if new_id is None:
         logger.warning("Food created but MyFitnessPal returned no id")
 
-    logger.info(f"Created custom food {new_id}: {spec['description']}")
+    logger.info("Created custom food")
     return {"id": new_id, "status": r.status_code, "description": spec["description"]}
 
 
@@ -1615,7 +916,7 @@ def delete_custom_food(client, food_id: str) -> int:
             f"Failed to delete custom food {food_id}: HTTP {r.status_code}"
             + (f" - {detail}" if detail else "")
         )
-    logger.info(f"Deleted custom food {food_id}")
+    logger.info("Deleted custom food")
     return r.status_code
 
 
@@ -1678,10 +979,7 @@ def add_food_to_diary(
             + (f" - {detail}" if detail else "")
         )
 
-    logger.info(
-        f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
-        f"x{quantity}) to {meal_name} for {target_date}"
-    )
+    logger.info("Added food to diary")
 
     # MFP returns the new entry's id here and nowhere else - the diary page
     # exposes only legacy numeric ids, which the v2 API does not accept.
@@ -1741,7 +1039,7 @@ def remove_diary_entry_v2(client, entry_id: str) -> None:
         timeout=30,
     )
     if response.status_code in (200, 204):
-        logger.info(f"Removed diary entry {entry_id}")
+        logger.info("Removed diary entry")
         return
     raise RuntimeError(
         f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
@@ -1784,7 +1082,7 @@ def remove_food_entry(client, entry_id: str) -> None:
     )
     # Success = 302 redirect to diary, or 200 with empty body
     if response.status_code in (200, 204, 302, 303):
-        logger.info(f"Removed diary entry {entry_id}")
+        logger.info("Removed diary entry")
         return
     raise RuntimeError(
         f"Remove failed for entry {entry_id}: HTTP {response.status_code}"
@@ -1851,7 +1149,7 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
         )
         response.raise_for_status()
 
-        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
+        logger.info("Set water intake")
 
     except Exception as e:
         # Don't expose internal error details to avoid leaking sensitive information
@@ -1931,7 +1229,7 @@ async def mfp_get_diary(params: GetDiaryInput) -> str:
         )
 
     except Exception as e:
-        return f"Error retrieving diary: {str(e)}"
+        return f"Error retrieving diary: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -1985,7 +1283,7 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
         )
 
     except Exception as e:
-        return f"Error searching foods: {str(e)}"
+        return f"Error searching foods: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2055,7 +1353,7 @@ async def mfp_get_food_details(params: GetFoodDetailsInput) -> str:
         return format_response(data, params.response_format, "Food Item Details")
 
     except Exception as e:
-        return f"Error getting food details: {str(e)}"
+        return f"Error getting food details: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2151,7 +1449,7 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting measurements: {str(e)}"
+        return f"Error getting measurements: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2194,7 +1492,7 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
         )
 
     except Exception as e:
-        return f"Error setting measurement: {str(e)}"
+        return f"Error setting measurement: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2248,7 +1546,7 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting exercises: {str(e)}"
+        return f"Error getting exercises: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2285,7 +1583,7 @@ async def mfp_get_goals(params: GetGoalsInput) -> str:
         return format_response(data, params.response_format, "Daily Nutrition Goals")
 
     except Exception as e:
-        return f"Error getting goals: {str(e)}"
+        return f"Error getting goals: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2352,7 +1650,7 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         )
 
     except Exception as e:
-        return f"Error setting goals: {str(e)}"
+        return f"Error setting goals: {type(e).__name__}; check your session or request"
 
 
 # WATER — always millilitres.
@@ -2409,7 +1707,7 @@ async def mfp_get_water(params: GetWaterInput) -> str:
         return json.dumps(_water_payload(day, str(target_date)), indent=2)
 
     except Exception as e:
-        return f"Error getting water intake: {str(e)}"
+        return f"Error getting water intake: {type(e).__name__}; check your session or request"
 
 
 # Step counts synced from Apple Health / Google Fit / device integrations land
@@ -2499,8 +1797,8 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
             raise ValueError("start_date must be on or before end_date")
         span = (end - start).days + 1
         if span > MAX_STEPS_RANGE_DAYS:
-            raise ValueError(
-                f"Range is {span} days; the maximum is {MAX_STEPS_RANGE_DAYS}. "
+            return (
+                f"Error: the maximum range is {MAX_STEPS_RANGE_DAYS} days. "
                 "Split it into smaller calls."
             )
 
@@ -2529,7 +1827,7 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
         return format_response(data, params.response_format, "Daily Steps")
 
     except Exception as e:
-        return f"Error getting steps: {str(e)}"
+        return f"Error getting steps: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2603,7 +1901,7 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         )
         
     except Exception as e:
-        return f"Error adding food to diary: {str(e)}"
+        return f"Error adding food to diary: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2705,7 +2003,7 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
         }, indent=2, ensure_ascii=False)
 
     except Exception as e:
-        return f"Error removing food: {e}"
+        return f"Error removing food: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2752,7 +2050,7 @@ async def mfp_set_water(params: SetWaterInput) -> str:
         )
         
     except Exception as e:
-        return f"Error setting water intake: {str(e)}"
+        return f"Error setting water intake: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -2824,132 +2122,12 @@ async def mfp_get_report(params: GetReportInput) -> str:
         )
 
     except Exception as e:
-        return f"Error getting report: {str(e)}"
+        return f"Error getting report: {type(e).__name__}; check your session or request"
 
 
 # ============================================================================
-# Cookie Management Tool
+# Custom Food Tools
 # ============================================================================
-
-
-def _verify_cookies_and_format(cookies: Dict[str, str], source: str) -> str:
-    """Verify cookies via a live MFP round-trip, then persist on success.
-
-    Persisting only after verification matches the auto-discovery path's
-    anti-poisoning behavior — a stale/expired session can't clobber a
-    previously good `cookies.json`.
-    """
-    if not _has_real_mfp_session(cookies):
-        return (
-            f"No MyFitnessPal session token found in {source}. "
-            "Make sure you are logged into myfitnesspal.com in that browser, "
-            "then try again."
-        )
-    try:
-        import myfitnesspal
-        cookiejar = dict_to_cookiejar(cookies)
-        client = myfitnesspal.Client(cookiejar=cookiejar)
-        _ = client.get_date(date.today())
-    except Exception as e:
-        return (
-            f"Cookies were extracted from {source} but verification failed: "
-            f"{e}. The session may have expired — log in again and retry. "
-            f"(cookies.json was NOT overwritten.)"
-        )
-    save_cookies(cookies)
-    return (
-        f"Successfully extracted and verified {len(cookies)} cookies "
-        f"from {source}. Authentication is now working."
-    )
-
-
-@mcp.tool()
-def refresh_browser_cookies(browser: str = "auto") -> str:
-    """
-    Extract and save session cookies from your web browser.
-
-    Use this tool when authentication fails and you need to refresh your
-    MyFitnessPal session. You must be logged into myfitnesspal.com in the
-    target browser.
-
-    Args:
-        browser: Source to extract cookies from. Options:
-                 - 'auto' (default): scan every installed Chromium-based
-                   browser on macOS (Arc, Chrome, Edge, Brave, Vivaldi,
-                   Opera, ...) and use the first one with a valid session.
-                 - 'arc', 'chrome', 'chromium', 'edge', 'brave', 'vivaldi',
-                   'opera': force a specific Chromium browser (macOS).
-                 - 'firefox': use browser_cookie3 (Firefox is not Chromium).
-
-    Returns:
-        Success message or error description.
-    """
-    browser_key = browser.lower().strip()
-
-    # 'auto' — discover every Chromium browser via keychain Safe Storage
-    if browser_key == "auto":
-        result = try_chromium_browsers_for_session_cookies()
-        if not result:
-            return (
-                "Auto-discovery did not find a Chromium browser with a "
-                "valid MyFitnessPal session. Log into myfitnesspal.com in "
-                "Arc, Chrome, Edge, Brave, Vivaldi, or Opera, then retry. "
-                "(macOS only — on Linux/Windows, pass 'chrome' or "
-                "'firefox' instead.)"
-            )
-        browser_name, cookies = result
-        return _verify_cookies_and_format(cookies, browser_name)
-
-    # Explicit Chromium browser
-    if browser_key in _CHROMIUM_BROWSER_ALIASES:
-        canonical = _CHROMIUM_BROWSER_ALIASES[browser_key]
-        if sys.platform == "darwin":
-            service_name = f"{canonical} Safe Storage"
-            cookies = _try_extract_from_chromium_browser(service_name)
-            if cookies is None:
-                return (
-                    f"Could not read cookies from {canonical}. Make sure "
-                    "the browser is installed and you have logged in at "
-                    "least once."
-                )
-            return _verify_cookies_and_format(cookies, canonical)
-        # Non-macOS: keychain-based path doesn't apply. browser_cookie3
-        # handles chrome/chromium on Linux/Windows via their default
-        # profile paths; other Chromium browsers aren't supported there.
-        if browser_key in ("chrome", "chromium"):
-            try:
-                import browser_cookie3
-                cj = browser_cookie3.chrome(domain_name=".myfitnesspal.com")
-                cookies = {c.name: c.value for c in cj}
-            except Exception as e:
-                return f"Error extracting cookies from {browser_key}: {e}"
-            return _verify_cookies_and_format(cookies, browser_key)
-        return (
-            f"{canonical} cookie extraction requires macOS (keychain-backed "
-            f"Safe Storage). On this platform, use 'chrome' or 'firefox'."
-        )
-
-    # Firefox via browser_cookie3 (it has its own format, not Chromium)
-    if browser_key == "firefox":
-        try:
-            import browser_cookie3
-            cj = browser_cookie3.firefox(domain_name=".myfitnesspal.com")
-            cookies = {c.name: c.value for c in cj}
-        except Exception as e:
-            return f"Error extracting cookies from firefox: {e}"
-        return _verify_cookies_and_format(cookies, "firefox")
-
-    valid_options = sorted({*_CHROMIUM_BROWSER_ALIASES, "firefox", "auto"})
-    return (
-        f"Unsupported browser: {browser!r}. Use 'auto' to scan all installed "
-        f"Chromium browsers, or one of: {', '.join(valid_options)}."
-    )
-
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
 
 
 @mcp.tool(
@@ -2991,7 +2169,7 @@ async def mfp_create_custom_food(params: CreateCustomFoodInput) -> str:
         result = create_custom_food(client, params.model_dump())
         return format_response(result, params.response_format, "Custom Food Created")
     except Exception as e:
-        return f"Error creating custom food: {str(e)}"
+        return f"Error creating custom food: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -3036,7 +2214,7 @@ async def mfp_list_own_foods(params: ListOwnFoodsInput) -> str:
         }
         return format_response(data, params.response_format, "My Custom Foods")
     except Exception as e:
-        return f"Error listing own foods: {str(e)}"
+        return f"Error listing own foods: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -3068,7 +2246,7 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         data = {"food_id": params.food_id, "deleted": True, "status": status}
         return format_response(data, params.response_format, "Custom Food Deleted")
     except Exception as e:
-        return f"Error deleting custom food: {str(e)}"
+        return f"Error deleting custom food: {type(e).__name__}; check your session or request"
 
 
 # ============================================================================
@@ -3182,7 +2360,7 @@ def create_fasting_entry(
         entry = response.json()["items"][0]
     except (ValueError, KeyError, IndexError, TypeError) as e:
         raise RuntimeError(
-            f"MFP returned HTTP 201 with an unexpected body: {response.text[:200]} ({e})"
+            "MFP returned HTTP 201 with an unexpected body structure"
         ) from None
     return {
         "id": entry["id"],
@@ -3330,7 +2508,7 @@ async def mfp_log_fast(params: LogFastInput) -> str:
         )
         return format_response(result, params.response_format, "Fast Logged")
     except Exception as e:
-        return f"Error logging fast: {str(e)}"
+        return f"Error logging fast: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -3366,7 +2544,7 @@ async def mfp_update_fast(params: UpdateFastInput) -> str:
         )
         return format_response(result, params.response_format, "Fast Updated")
     except Exception as e:
-        return f"Error updating fast: {str(e)}"
+        return f"Error updating fast: {type(e).__name__}; check your session or request"
 
 
 @mcp.tool(
@@ -3398,12 +2576,12 @@ async def mfp_delete_fast(params: DeleteFastInput) -> str:
         result = delete_fasting_entry(client, params.id)
         return format_response(result, params.response_format, "Fast Deleted")
     except Exception as e:
-        return f"Error deleting fast: {str(e)}"
+        return f"Error deleting fast: {type(e).__name__}; check your session or request"
 
 
 def main():
     """Run the MCP server."""
-    mcp.run()
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

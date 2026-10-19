@@ -208,12 +208,13 @@ def test_user_id_is_not_sent():
     assert "user_id" not in session.posted["item"]
 
 
-def test_error_detail_prefers_structured_fields():
-    """Failures report MFP's own message rather than a slice of the raw body."""
-    resp = _FakeResponse(400, {"error_description": "Request payload does not contain any food objects"})
-    assert server._api_error_detail(resp) == "Request payload does not contain any food objects"
-    assert server._api_error_detail(_FakeResponse(400, {"error": "bad-request"})) == "bad-request"
-    assert server._api_error_detail(_FakeResponse(500, "not json at all")) == ""
+def test_error_detail_does_not_forward_remote_secrets():
+    """Remote errors may echo headers, cookies or submitted data."""
+    for payload in ({"error_description": "secret-token"},
+                    {"error": "secret-token"}, "secret-token"):
+        detail = server._api_error_detail(_FakeResponse(400, payload))
+        assert "secret-token" not in detail
+        assert "withheld" in detail
 
 
 # --- water passthrough + markdown ordering (regression, 2026-07-30) --------
